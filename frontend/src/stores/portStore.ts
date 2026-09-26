@@ -5,6 +5,8 @@ import { toPlain, uid } from '../utils/format';
 import { emptyPortFilter, type FishingPort, type PortFilter, type SupplyCapability } from '../types/port';
 import type { Berth, BerthStatus } from '../types/berth';
 import type { CallDraft, PortCall } from '../types/call';
+import type { FishingVessel } from '../types/vessel';
+import { checkCallRules } from '../utils/callRules';
 import { buildBerthRecords } from '../db/berth';
 
 export interface PortInput {
@@ -143,14 +145,21 @@ export const usePortStore = defineStore('port', () => {
 
   /**
    * 登记一条进出港记录，并同步泊位占用状态（进港 → 占用，出港 → 释放）。
+   * 与页面共用 checkCallRules：进港要求证书在登记当天结束时仍有效且泊位空闲；
+   * 出港不查证书，但泊位必须由同一艘船占用。校验失败直接抛错，不写库、不动泊位。
    */
-  async function registerCall(draft: CallDraft, vesselName: string, portId: string): Promise<PortCall> {
+  async function registerCall(draft: CallDraft, vessel: FishingVessel, portId: string): Promise<PortCall> {
+    const time = draft.time ? new Date(draft.time).toISOString() : new Date().toISOString();
+    const berth = berths.value.find((b) => b.portId === portId && b.berthNo === draft.berthNo);
+    const failure = checkCallRules({ type: draft.type, vessel, berth, time });
+    if (failure || !berth) throw new Error(failure ?? '请选择有效的泊位');
+
     const call: PortCall = {
       id: uid('c'),
       vesselId: draft.vesselId,
-      vesselName,
+      vesselName: vessel.name,
       type: draft.type,
-      time: draft.time ? new Date(draft.time).toISOString() : new Date().toISOString(),
+      time,
       berthNo: draft.berthNo,
       iceKg: Number(draft.iceKg) || 0,
       fuelL: Number(draft.fuelL) || 0,
@@ -161,29 +170,27 @@ export const usePortStore = defineStore('port', () => {
     await db.calls.put(toPlain(call));
     calls.value = [...calls.value, call];
 
-    const berth = berths.value.find((b) => b.portId === portId && b.berthNo === draft.berthNo);
-    if (berth) {
-      const next: Berth =
-        draft.type === '进港'
-          ? {
-              ...berth,
-              status: '占用',
-              vesselId: draft.vesselId,
-              vesselName,
-              berthAt: call.time,
-              leaveAt: null,
-            }
-          : {
-              ...berth,
-              status: '空闲',
-              vesselId: null,
-              vesselName: null,
-              berthAt: null,
-              leaveAt: call.time,
-            };
-      await db.berths.put(toPlain(next));
-      berths.value = berths.value.map((b) => (b.id === berth.id ? next : b));
-    }
+    // 校验已保证进港泊位空闲、出港泊位归本船，这里只会占用空位或释放本船位置
+    const next: Berth =
+      draft.type === '进港'
+        ? {
+            ...berth,
+            status: '占用',
+            vesselId: draft.vesselId,
+            vesselName: vessel.name,
+            berthAt: call.time,
+            leaveAt: null,
+          }
+        : {
+            ...berth,
+            status: '空闲',
+            vesselId: null,
+            vesselName: null,
+            berthAt: null,
+            leaveAt: call.time,
+          };
+    await db.berths.put(toPlain(next));
+    berths.value = berths.value.map((b) => (b.id === berth.id ? next : b));
     return call;
   }
 

@@ -9,8 +9,9 @@ import { useBerthStatus } from '../hooks/useBerthStatus';
 import BerthGrid from '../components/common/BerthGrid.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { Berth } from '../types/berth';
-import { CALL_TYPES, VISA_STATUSES, emptyCallDraft, type CallDraft, type CallType } from '../types/call';
+import { CALL_TYPES, VISA_STATUSES, emptyCallDraft, type CallDraft } from '../types/call';
 import { formatDateTime, formatNumber, isToday, nowLocalInputValue, toPlain } from '../utils/format';
+import { berthOpenForArrival, berthOwnedBy, certificateValidOn, checkCallRules } from '../utils/callRules';
 
 interface CallForm extends CallDraft {
   portId: string;
@@ -41,17 +42,31 @@ const vesselOptions = computed(() => vesselStore.vessels);
 
 const selectedVessel = computed(() => vesselStore.vesselById(form.value.vesselId));
 
-/** 进港只能选空闲泊位；出港只能选已占用泊位 */
+/** 进港只能选空闲泊位；出港只能选本船占用的泊位（与提交校验同一套判断） */
 const berthOptions = computed(() => {
-  const wanted = form.value.type === '进港' ? '空闲' : '占用';
+  const type = form.value.type;
+  const vesselId = form.value.vesselId;
   return portStore.berths
-    .filter((b) => b.status === wanted)
+    .filter((b) => (type === '进港' ? berthOpenForArrival(b) : berthOwnedBy(b, vesselId)))
     .map((b) => ({
       value: `${b.portId}|${b.berthNo}`,
       label: `${portStore.portById(b.portId)?.name ?? b.portId} · ${b.berthNo}`,
       portId: b.portId,
     }))
     .sort((a, b) => a.label.localeCompare(b.label));
+});
+
+const berthPlaceholder = computed(() => {
+  if (form.value.type === '进港') return '选择空闲泊位';
+  return form.value.vesselId ? '选择本船占用的泊位' : '请先选择渔船';
+});
+
+/** 进港且证书在登记当天结束时已失效时给出提示（与提交校验同一套判断） */
+const certificateHint = computed(() => {
+  const vessel = selectedVessel.value;
+  if (!vessel || form.value.type !== '进港' || !form.value.time) return '';
+  if (certificateValidOn(vessel.certificateExpiry, form.value.time)) return '';
+  return `不适合进港：证书有效期至 ${vessel.certificateExpiry}，登记当天结束时已失效`;
 });
 
 const berthKey = computed({
@@ -91,6 +106,15 @@ function hasContent(value: CallForm): boolean {
   );
 }
 
+/** 换船、换类型或恢复草稿后重新核验旧泊位选择，不符合当前规则即清空 */
+function revalidateBerth(): void {
+  if (!form.value.portId || !form.value.berthNo) return;
+  const berth = portStore.berths.find((b) => b.portId === form.value.portId && b.berthNo === form.value.berthNo);
+  const ok =
+    form.value.type === '进港' ? berthOpenForArrival(berth) : berthOwnedBy(berth, form.value.vesselId);
+  if (!ok) berthKey.value = '';
+}
+
 onMounted(async () => {
   if (!portStore.ports.length) await portStore.loadAll();
   if (!vesselStore.vessels.length) await vesselStore.loadAll();
@@ -102,6 +126,8 @@ onMounted(async () => {
       clearDraft();
     }
   }
+  // 草稿可能是很久前保存的，泊位占用与船舶状态已变化，恢复后必须重新核验
+  revalidateBerth();
   if (form.value.portId) focusPortId.value = form.value.portId;
 });
 
@@ -115,15 +141,24 @@ watch(
   { deep: true },
 );
 
-watch(
-  () => form.value.type,
-  (type: CallType) => {
-    const valid = berthOptions.value.some((opt) => opt.value === berthKey.value);
-    if (!valid) berthKey.value = '';
-  },
-);
+watch([() => form.value.type, () => form.value.vesselId], () => {
+  revalidateBerth();
+});
 
 function selectBerth(berth: Berth): void {
+  // 与提交校验同一套判断：进港需空闲泊位，出港需本船占用的泊位
+  if (form.value.type === '进港' && !berthOpenForArrival(berth)) {
+    ElMessage.warning(`不适合进港：泊位 ${berth.berthNo} 当前为「${berth.status}」，进港需选择空闲泊位`);
+    return;
+  }
+  if (form.value.type === '出港' && !berthOwnedBy(berth, form.value.vesselId)) {
+    ElMessage.warning(
+      form.value.vesselId
+        ? `泊位归属不符：泊位 ${berth.berthNo} 未由所选渔船占用，不能登记出港`
+        : '请先选择渔船，出港只能选本船占用的泊位',
+    );
+    return;
+  }
   berthKey.value = `${berth.portId}|${berth.berthNo}`;
   ElMessage.info(`已选择 ${berth.berthNo}`);
 }
@@ -132,8 +167,16 @@ async function submit(): Promise<void> {
   if (!formRef.value) return;
   const valid = await formRef.value.validate().catch(() => false);
   if (!valid) return;
-  if (!selectedVessel.value) {
+  const vessel = selectedVessel.value;
+  if (!vessel) {
     ElMessage.warning('请选择有效的渔船');
+    return;
+  }
+  // 提交时再查一遍（泊位占用可能已被其他操作改变）；失败时表单与泊位都保持不变
+  const berth = portStore.berths.find((b) => b.portId === form.value.portId && b.berthNo === form.value.berthNo);
+  const failure = checkCallRules({ type: form.value.type, vessel, berth, time: form.value.time });
+  if (failure) {
+    ElMessage.error(failure);
     return;
   }
   submitting.value = true;
@@ -148,7 +191,7 @@ async function submit(): Promise<void> {
       unloadKg: Number(form.value.unloadKg) || 0,
       visaStatus: form.value.visaStatus,
     };
-    const call = await portStore.registerCall(payload, selectedVessel.value.name, form.value.portId);
+    const call = await portStore.registerCall(payload, vessel, form.value.portId);
     ElMessage.success(`已登记 ${call.vesselName} ${call.type} · 泊位 ${call.berthNo}`);
     clearDraft();
     Object.assign(form.value, {
@@ -175,7 +218,8 @@ function openVessel(vesselId: string): void {
       <div>
         <h1>进出港登记</h1>
         <p class="page__sub">
-          选择渔船与进出港类型，填写泊位号、加冰量、加油量与卸货量，提交后自动同步泊位占用状态
+          选择渔船与进出港类型，填写泊位号、加冰量、加油量与卸货量，提交后自动同步泊位占用状态。
+          进港要求证书在登记当天结束时仍有效且泊位空闲；出港不查证书，但只能释放本船占用的泊位。
         </p>
       </div>
     </header>
@@ -208,6 +252,7 @@ function openVessel(vesselId: string): void {
                   :value="v.id"
                 />
               </el-select>
+              <p v-if="certificateHint" class="form-hint" data-testid="certificate-hint">{{ certificateHint }}</p>
             </el-form-item>
 
             <el-form-item label="进出港类型" prop="type">
@@ -231,7 +276,7 @@ function openVessel(vesselId: string): void {
               <el-select
                 id="call-berth"
                 v-model="berthKey"
-                :placeholder="form.type === '进港' ? '选择空闲泊位' : '选择已占用泊位'"
+                :placeholder="berthPlaceholder"
                 style="width: 100%"
                 data-testid="call-berth"
               >
@@ -376,5 +421,11 @@ function openVessel(vesselId: string): void {
   margin: 10px 0 0;
   font-size: 12px;
   color: #6b7c8c;
+}
+.form-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #e6a23c;
 }
 </style>
