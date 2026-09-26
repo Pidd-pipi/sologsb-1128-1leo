@@ -5,6 +5,8 @@ import { toPlain, uid } from '../utils/format';
 import { emptyPortFilter, type FishingPort, type PortFilter, type SupplyCapability } from '../types/port';
 import type { Berth, BerthStatus } from '../types/berth';
 import type { CallDraft, PortCall } from '../types/call';
+import type { FishingVessel } from '../types/vessel';
+import { assertCallEligibility } from '../utils/callGuard';
 import { buildBerthRecords } from '../db/berth';
 
 export interface PortInput {
@@ -143,14 +145,23 @@ export const usePortStore = defineStore('port', () => {
 
   /**
    * 登记一条进出港记录，并同步泊位占用状态（进港 → 占用，出港 → 释放）。
+   *
+   * 保存前按与页面完全相同的规则再查一遍：进港要求证书在登记当天结束时仍有效、
+   * 泊位空闲；出港不查证书，但泊位必须由同一艘船占用。校验先于任何写库，
+   * 失败时抛 CallGuardError，流水与泊位状态都不变化。
    */
-  async function registerCall(draft: CallDraft, vesselName: string, portId: string): Promise<PortCall> {
+  async function registerCall(draft: CallDraft, vessel: FishingVessel, portId: string): Promise<PortCall> {
+    const time = draft.time ? new Date(draft.time).toISOString() : new Date().toISOString();
+    const berth = berths.value.find((b) => b.portId === portId && b.berthNo === draft.berthNo);
+
+    assertCallEligibility({ vessel, type: draft.type, time: draft.time || time, berth });
+
     const call: PortCall = {
       id: uid('c'),
       vesselId: draft.vesselId,
-      vesselName,
+      vesselName: vessel.name,
       type: draft.type,
-      time: draft.time ? new Date(draft.time).toISOString() : new Date().toISOString(),
+      time,
       berthNo: draft.berthNo,
       iceKg: Number(draft.iceKg) || 0,
       fuelL: Number(draft.fuelL) || 0,
@@ -161,7 +172,7 @@ export const usePortStore = defineStore('port', () => {
     await db.calls.put(toPlain(call));
     calls.value = [...calls.value, call];
 
-    const berth = berths.value.find((b) => b.portId === portId && b.berthNo === draft.berthNo);
+    // berth 已在 assertCallEligibility 中确认存在（进港空闲 / 出港归属同一艘船）
     if (berth) {
       const next: Berth =
         draft.type === '进港'
@@ -169,7 +180,7 @@ export const usePortStore = defineStore('port', () => {
               ...berth,
               status: '占用',
               vesselId: draft.vesselId,
-              vesselName,
+              vesselName: vessel.name,
               berthAt: call.time,
               leaveAt: null,
             }

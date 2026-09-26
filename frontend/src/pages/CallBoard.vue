@@ -9,7 +9,8 @@ import { useBerthStatus } from '../hooks/useBerthStatus';
 import BerthGrid from '../components/common/BerthGrid.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { Berth } from '../types/berth';
-import { CALL_TYPES, VISA_STATUSES, emptyCallDraft, type CallDraft, type CallType } from '../types/call';
+import { CALL_TYPES, VISA_STATUSES, emptyCallDraft, type CallDraft } from '../types/call';
+import { checkCallEligibility, isBerthSelectionStillValid, isCertificateValidOn } from '../utils/callGuard';
 import { formatDateTime, formatNumber, isToday, nowLocalInputValue, toPlain } from '../utils/format';
 
 interface CallForm extends CallDraft {
@@ -41,11 +42,24 @@ const vesselOptions = computed(() => vesselStore.vessels);
 
 const selectedVessel = computed(() => vesselStore.vesselById(form.value.vesselId));
 
-/** 进港只能选空闲泊位；出港只能选已占用泊位 */
+/** 当前所选泊位实时记录（可能已被其他操作占用/释放，所以始终从 store 取） */
+const selectedBerth = computed(() =>
+  form.value.portId && form.value.berthNo
+    ? portStore.berths.find((b) => b.portId === form.value.portId && b.berthNo === form.value.berthNo)
+    : undefined,
+);
+
+/**
+ * 可选泊位与提交保存使用同一套判断：
+ * - 进港：只列空闲泊位（证书是否有效在提交时按登记日再查）；
+ * - 出港：只列当前由所选渔船占用的泊位，避免选到别的船的泊位误释放。
+ */
 const berthOptions = computed(() => {
-  const wanted = form.value.type === '进港' ? '空闲' : '占用';
-  return portStore.berths
-    .filter((b) => b.status === wanted)
+  const list =
+    form.value.type === '进港'
+      ? portStore.berths.filter((b) => b.status === '空闲')
+      : portStore.berths.filter((b) => b.status === '占用' && b.vesselId && b.vesselId === form.value.vesselId);
+  return list
     .map((b) => ({
       value: `${b.portId}|${b.berthNo}`,
       label: `${portStore.portById(b.portId)?.name ?? b.portId} · ${b.berthNo}`,
@@ -53,6 +67,11 @@ const berthOptions = computed(() => {
     }))
     .sort((a, b) => a.label.localeCompare(b.label));
 });
+
+/** 进港时证书在登记当天结束时是否仍有效（用于表单内即时提示，提交时仍会再查一遍） */
+const certValidOnDay = computed(() =>
+  selectedVessel.value ? isCertificateValidOn(selectedVessel.value.certificateExpiry, form.value.time) : true,
+);
 
 const berthKey = computed({
   get: () => (form.value.portId && form.value.berthNo ? `${form.value.portId}|${form.value.berthNo}` : ''),
@@ -102,7 +121,10 @@ onMounted(async () => {
       clearDraft();
     }
   }
-  if (form.value.portId) focusPortId.value = form.value.portId;
+  // 恢复草稿后旧泊位选择先按当前泊位状态重新核验，再聚焦对应渔港；
+  // 若泊位已不空闲或归属不符，会清空旧选择并说明原因
+  revalidateBerthSelection();
+  focusPortId.value = form.value.portId || '';
 });
 
 watch(
@@ -115,15 +137,47 @@ watch(
   { deep: true },
 );
 
+/**
+ * 换船、换类型或恢复草稿后，旧泊位选择要重新核验。
+ * 仅当泊位本身不再满足条件（进港不空闲 / 出港归属不符 / 泊位消失）时清空旧选择；
+ * 证书失效（不适合进港）不清泊位，留到提交时再拦截并说明原因。
+ * 清空时不改动任何泊位状态，只重置表单中的泊位字段。
+ */
+function revalidateBerthSelection(silent = false): void {
+  if (!form.value.portId || !form.value.berthNo) return;
+  const vessel = selectedVessel.value;
+  const berth = selectedBerth.value;
+  if (!vessel) return; // 未选船时无法核验归属，保留选择，提交时再提示
+  const stillValid = isBerthSelectionStillValid({ vessel, type: form.value.type, time: form.value.time, berth });
+  if (stillValid) return;
+  const result = checkCallEligibility({ vessel, type: form.value.type, time: form.value.time, berth });
+  form.value.berthNo = '';
+  form.value.portId = '';
+  focusPortId.value = '';
+  if (!silent) ElMessage.warning(`原泊位选择已失效，请重新选择：${result.message}`);
+}
+
 watch(
-  () => form.value.type,
-  (type: CallType) => {
-    const valid = berthOptions.value.some((opt) => opt.value === berthKey.value);
-    if (!valid) berthKey.value = '';
-  },
+  () => [form.value.vesselId, form.value.type] as const,
+  () => revalidateBerthSelection(),
 );
 
 function selectBerth(berth: Berth): void {
+  if (!selectedVessel.value) {
+    ElMessage.warning('请先选择渔船，再选择泊位');
+    return;
+  }
+  // 网格点击同样走统一判断：进港证书有效 + 泊位空闲；出港泊位归属同一艘船
+  const result = checkCallEligibility({
+    vessel: selectedVessel.value,
+    type: form.value.type,
+    time: form.value.time,
+    berth,
+  });
+  if (!result.ok) {
+    ElMessage.warning(result.message);
+    return;
+  }
   berthKey.value = `${berth.portId}|${berth.berthNo}`;
   ElMessage.info(`已选择 ${berth.berthNo}`);
 }
@@ -132,8 +186,21 @@ async function submit(): Promise<void> {
   if (!formRef.value) return;
   const valid = await formRef.value.validate().catch(() => false);
   if (!valid) return;
-  if (!selectedVessel.value) {
+  const vessel = selectedVessel.value;
+  if (!vessel) {
     ElMessage.warning('请选择有效的渔船');
+    return;
+  }
+  // 提交时按 store 中最新的泊位状态再查一遍（泊位可能在填表期间被其他登记占用/释放）
+  const result = checkCallEligibility({
+    vessel,
+    type: form.value.type,
+    time: form.value.time,
+    berth: selectedBerth.value,
+  });
+  if (!result.ok) {
+    // 明确区分：证书失效是「不适合进港」，泊位状态/归属问题是「泊位归属不符或不可用」
+    ElMessage.error(`登记失败：${result.message}。表单与泊位状态均未改动，请调整后重新提交`);
     return;
   }
   submitting.value = true;
@@ -148,7 +215,8 @@ async function submit(): Promise<void> {
       unloadKg: Number(form.value.unloadKg) || 0,
       visaStatus: form.value.visaStatus,
     };
-    const call = await portStore.registerCall(payload, selectedVessel.value.name, form.value.portId);
+    // store 保存路径用同一套规则复核；校验先于写库，失败时表单与泊位都不变化
+    const call = await portStore.registerCall(payload, vessel, form.value.portId);
     ElMessage.success(`已登记 ${call.vesselName} ${call.type} · 泊位 ${call.berthNo}`);
     clearDraft();
     Object.assign(form.value, {
@@ -158,7 +226,7 @@ async function submit(): Promise<void> {
     });
     focusPortId.value = '';
   } catch (error) {
-    ElMessage.error(`登记失败：${(error as Error).message}`);
+    ElMessage.error(`登记失败：${(error as Error).message}。表单与泊位状态均未改动`);
   } finally {
     submitting.value = false;
   }
@@ -216,6 +284,16 @@ function openVessel(vesselId: string): void {
               </el-radio-group>
             </el-form-item>
 
+            <el-alert
+              v-if="selectedVessel && form.type === '进港' && !certValidOnDay"
+              type="error"
+              show-icon
+              :closable="false"
+              class="cert-alert"
+              data-testid="cert-expired-alert"
+              :title="`${selectedVessel.name} 证书有效期至 ${selectedVessel.certificateExpiry}，在登记日当天已失效，不适合进港`"
+            />
+
             <el-form-item label="时间" prop="time">
               <el-date-picker
                 id="call-time"
@@ -231,7 +309,13 @@ function openVessel(vesselId: string): void {
               <el-select
                 id="call-berth"
                 v-model="berthKey"
-                :placeholder="form.type === '进港' ? '选择空闲泊位' : '选择已占用泊位'"
+                :placeholder="
+                  form.type === '进港'
+                    ? '选择空闲泊位'
+                    : selectedVessel
+                      ? '选择该渔船当前占用的泊位'
+                      : '请先选择渔船（出港需核验泊位归属）'
+                "
                 style="width: 100%"
                 data-testid="call-berth"
               >
@@ -353,6 +437,9 @@ function openVessel(vesselId: string): void {
 }
 .draft-alert {
   border-radius: 10px;
+}
+.cert-alert {
+  margin: 0 0 18px 110px;
 }
 .stat-row {
   display: flex;
